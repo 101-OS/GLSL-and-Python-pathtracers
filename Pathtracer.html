@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Monte Carlo Path Tracer + WASD + Progressive Sampling</title>
+<style>
+  body,html { margin: 0; overflow: hidden; height: 100%; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<script src="https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.min.js"></script>
+<script>
+(() => {
+  const maxSamples = 145;
+  const BOUNCES = 20;
+
+  const fragmentShader = `
+#define BOUNCES ${BOUNCES}
+#define EPS 0.01
+#define LIGHTCOL vec3(20,15,10)
+
+uniform vec3 uCamPos;
+uniform vec3 uCamDir;
+uniform vec2 iResolution;
+uniform float iTime;
+uniform int uSamples;
+
+float hash(inout float s){ return fract(sin(s+=.1)*43758.5);}
+vec2 hash2(inout float s){ return vec2(hash(s),hash(s));}
+vec3 cosineHemisphere(vec3 n,inout float s){
+  vec2 r=hash2(s); float a=6.2831*r.x,z=sqrt(1.-r.y),xy=sqrt(r.y);
+  vec3 u=normalize(cross(abs(n.y)<.99?vec3(0,1,0):vec3(1,0,0),n)),v=cross(n,u);
+  return normalize(xy*cos(a)*u+xy*sin(a)*v+z*n);
+}
+float iSph(vec3 ro,vec3 rd,vec4 sph,out vec3 n){
+  vec3 oc=ro-sph.xyz; float b=dot(oc,rd),c=dot(oc,oc)-sph.w*sph.w,h=b*b-c;
+  if(h < 0.) return -1.;
+  float t=-b-sqrt(h);
+  if(t>EPS){vec3 p=ro+t*rd;n=normalize(p-sph.xyz);return t;}
+  return-1.;
+}
+float iPln(vec3 ro,vec3 rd,vec4 pl,out vec3 n){
+  float d=dot(pl.xyz,rd); if(abs(d)<EPS)return-1.; float t=-(dot(pl.xyz,ro)+pl.w)/d;
+  if(t>EPS) {n=pl.xyz;return t;} return-1.;
+}
+vec3 sampleLight(vec3 p,inout float s,vec4 l){
+  vec2 h=hash2(s)*vec2(2.,6.2831)-vec2(1,0);
+  float phi=h.y; vec3 d=vec3(sqrt(1.-h.x*h.x)*vec2(cos(phi),sin(phi)),h.x);
+  return normalize(l.xyz+l.w*d-p);
+}
+bool occluded(vec3 ro,vec3 rd,float d,vec4 s1,vec4 s2){
+  vec3 n; float t=iSph(ro,rd,s1,n); if(t>0.&&t<d)return true;
+  t=iSph(ro,rd,s2,n); if(t>0.&&t<d)return true; return false;
+}
+vec3 trace(vec3 ro,vec3 rd,inout float s){
+  vec3 col=vec3(0),mask=vec3(1),n,nh,p; float t,tmin;
+  vec4 l=vec4(3,3,3,0.5),s1=vec4(1.5,1,3,1),s2=vec4(4,1,4,1);
+  for(int i=0;i<BOUNCES;i++){
+    tmin= 1e9; vec3 c=vec3(0.8);
+    t=iPln(ro,rd,vec4(0,1,0,0),n);if(t>0.&&t<tmin){tmin=t;nh=n;c=vec3(0.8);}
+    t=iPln(ro,rd,vec4(1,0,0,0),n);if(t>0.&&t<tmin){tmin=t;nh=n;c=vec3(0.1,0.6,0.2);}
+    t=iPln(ro,rd,vec4(-1,0,0,5.5),n);if(t>0.&&t<tmin){tmin=t;nh=n;c=vec3(0.7,0.2,0.1);}
+    t=iSph(ro,rd,s1,n);if(t>0.&&t<tmin){tmin=t;nh=n;c=vec3(0.5,0.6,0.9);}
+    t=iSph(ro,rd,s2,n);if(t>0.&&t<tmin){tmin=t;nh=n;c=vec3(0.9,0.6,0.6);}
+    t=iSph(ro,rd,l,n);if(t>0.&&t<tmin){col+=mask*LIGHTCOL;break;}
+    if(tmin>1e8)break;
+    p=ro+rd*tmin; ro=p+nh*EPS; rd=cosineHemisphere(nh,s); mask*=c;
+    vec3 ld=sampleLight(p,s,l); float d=length(l.xyz-p);
+    if(!occluded(p+nh*EPS,ld,d,s1,s2))
+      col+=mask*LIGHTCOL*max(0.,dot(nh,ld))*(1./(d*d))*0.5;
+  }
+  return col;
+}
+void mainImage(out vec4 fragColor,in vec2 fragCoord){
+  vec2 uv=(fragCoord/iResolution.xy)*2.-1.; uv.x*=iResolution.x/iResolution.y;
+  vec3 ro=uCamPos;
+  vec3 ww=normalize(uCamDir);
+  vec3 uu=normalize(cross(vec3(0,1,0),ww));
+  vec3 vv=cross(ww,uu);
+  vec3 col=vec3(0);
+  float s=dot(fragCoord,vec2(12.9898,78.233)) + iTime*1e3;
+  for(int i=0;i<100;i++){
+    if(i >= uSamples) break;
+    vec2 j =(hash2(s)-.5)/iResolution.xy;
+    vec3 rd=normalize((uv.x+j.x)*uu+(uv.y+j.y)*vv+1.5*ww);
+    col+=trace(ro,rd,s);
+  }
+  col/=float(uSamples); col=pow(clamp(col,0.,1.),vec3(1./2.2));
+  fragColor=vec4(col,1);
+}
+void main() {
+  mainImage(gl_FragColor, gl_FragCoord.xy);
+}
+`;
+
+  const renderer = new THREE.WebGLRenderer();
+  document.body.appendChild(renderer.domElement);
+
+  const camera = new THREE.Camera(); // dummy camera
+  const scene = new THREE.Scene();
+
+  const uniforms = {
+    iResolution: { value: new THREE.Vector2(window.innerWidth, window.innerHeight) },
+    iTime: { value: 0 },
+    uCamPos: { value: new THREE.Vector3(2.5, 2.5, -7) },
+    uCamDir: { value: new THREE.Vector3(0, 0, 1) },
+    uSamples: { value: 1 }
+  };
+
+  const geometry = new THREE.PlaneGeometry(2, 2);
+  const material = new THREE.ShaderMaterial({
+    fragmentShader,
+    vertexShader: `
+      void main() {
+        gl_Position = vec4(position, 1.0);
+      }
+    `,
+    uniforms,
+  });
+
+  const quad = new THREE.Mesh(geometry, material);
+  scene.add(quad);
+
+  function onResize() {
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    uniforms.iResolution.value.set(window.innerWidth, window.innerHeight);
+  }
+  window.addEventListener('resize', onResize);
+  onResize();
+
+  // Camera control variables
+  let pos = new THREE.Vector3(2.5, 2.5, -7);
+  let yaw = 0;
+  let pitch = 0;
+  const speed = 0.1;
+  const sensitivity = 0.002;
+
+  const keys = { w:false, a:false, s:false, d:false };
+
+  window.addEventListener('keydown', e => {
+    if(e.code === 'KeyW') keys.w = true;
+    if(e.code === 'KeyA') keys.a = true;
+    if(e.code === 'KeyS') keys.s = true;
+    if(e.code === 'KeyD') keys.d = true;
+  });
+  window.addEventListener('keyup', e => {
+    if(e.code === 'KeyW') keys.w = false;
+    if(e.code === 'KeyA') keys.a = false;
+    if(e.code === 'KeyS') keys.s = false;
+    if(e.code === 'KeyD') keys.d = false;
+  });
+
+  let dragging = false;
+  let prevX = 0;
+  let prevY = 0;
+
+  window.addEventListener('mousedown', e => {
+    dragging = true;
+    prevX = e.clientX;
+    prevY = e.clientY;
+  });
+  window.addEventListener('mouseup', e => {
+    dragging = false;
+  });
+  window.addEventListener('mousemove', e => {
+    if (!dragging) return;
+    const dx = e.clientX - prevX;
+    const dy = e.clientY - prevY;
+    prevX = e.clientX;
+    prevY = e.clientY;
+    yaw -= dx * sensitivity;
+    pitch -= dy * sensitivity;
+    pitch = Math.min(Math.max(pitch, -Math.PI/2 + 0.01), Math.PI/2 - 0.01);
+  });
+
+  let lastPos = pos.clone();
+  let currentSamples = 1;
+
+  function animate(time = 0) {
+    requestAnimationFrame(animate);
+
+    // Calculate camera direction vector from yaw/pitch
+    const dir = new THREE.Vector3(
+      Math.cos(pitch) * Math.sin(yaw),
+      Math.sin(pitch),
+      Math.cos(pitch) * Math.cos(yaw)
+    ).normalize();
+
+    const right = new THREE.Vector3(Math.sin(yaw - Math.PI / 2), 0, Math.cos(yaw - Math.PI / 2));
+
+    let moved = false;
+
+    if (keys.w) { pos.addScaledVector(dir, speed); moved = true; }
+    if (keys.s) { pos.addScaledVector(dir, -speed); moved = true; }
+    if (keys.a) { pos.addScaledVector(right, -speed); moved = true; }
+    if (keys.d) { pos.addScaledVector(right, speed); moved = true; }
+
+    // Also treat mouse look as movement if yaw or pitch changed
+    if (!pos.equals(lastPos)) moved = true;
+
+    if (moved) {
+      currentSamples = 1;
+    } else {
+      if (currentSamples < maxSamples) currentSamples++;
+    }
+
+    lastPos.copy(pos);
+
+    uniforms.uCamPos.value.copy(pos);
+    uniforms.uCamDir.value.copy(dir);
+    uniforms.uSamples.value = currentSamples;
+    uniforms.iTime.value = time * 0.001;
+
+    renderer.render(scene, camera);
+  }
+
+  animate();
+})();
+</script>
+</body>
+</html>
